@@ -1,0 +1,164 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity uart_loopback is
+    generic (
+        CLKFREQ            : integer := 100E6;     -- 100 Mhz clock
+        BAUDRATE           : integer := 921600;    --115200;
+        TOTAL_BITS         : integer := 32;        -- Provide the number of bits as a multiple of 8. Since the clock is 100MHz, every bit has a duration of 10ns.
+        DATA_WIDTH         : integer := 8;
+        PARITY             : string  := "NONE";    -- NONE, EVEN, ODD
+        STOP_WIDTH         : integer := 1
+                
+    );
+    port (
+        clk     : in  std_logic;
+        -- external interface signals
+        rst          : in std_logic;
+        i_rxData     : in  std_logic;
+        o_txData     : out std_logic;
+        o_rxLed      : out std_logic;
+        o_txLed      : out std_logic;
+        led1         : out std_logic;       
+        btn0         : in  std_logic;
+        btn1         : in  std_logic;
+        o_trigger    : out  std_logic    
+    );
+end uart_loopback;
+
+architecture rtl of uart_loopback is
+    type State_Type is (Idle, Receiving, Waiting, Transmitting);
+    signal state: State_Type := Idle;
+
+    signal s_paralel_data  : std_logic_vector(DATA_WIDTH-1 downto 0);
+    signal s_uartData_ready : std_logic;
+    signal s_uartData_valid : std_logic;
+    
+    constant N: integer := TOTAL_BITS / DATA_WIDTH;
+    signal s_byte_count: integer range 0 to N := 0;
+    signal s_data_received: std_logic := '0';
+    signal shift_reg: std_logic_vector(TOTAL_BITS-1 downto 0);
+    signal i_trigger_s : std_logic := '0';
+    signal count_shifting_s : integer range 0 to TOTAL_BITS := 0;
+             
+    component uart_rx is
+    generic (
+        CLKFREQ    : integer := 100E6;
+        BAUDRATE   : integer;
+        DATA_WIDTH : integer := 8;
+        PARITY     : string  := "NONE"; -- NONE, EVEN, ODD
+        STOP_WIDTH : integer := 1
+    );
+    port (
+        clk : in  std_logic;
+        -- external interface signals
+        i_rxData : in  std_logic;
+        -- axi stream interface
+        i_data_ready  : in  std_logic;
+        o_rxData      : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        o_rxData_valid: out std_logic;
+        o_rxLed       : out std_logic        
+    );
+    end component;
+
+    component uart_tx is
+    generic (
+        CLKFREQ    : integer := 100E6;
+        BAUDRATE   : integer;
+        DATA_WIDTH : integer := 8;
+        PARITY     : string  := "NONE"; -- NONE, EVEN, ODD
+        STOP_WIDTH : integer := 1
+    );
+    port (
+        clk : in  std_logic;   
+        o_txData : out std_logic;  
+        i_txData_valid  : in  std_logic;
+        i_txData        : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        o_txData_ready  : out std_logic;
+        o_txLed         : out std_logic
+    );
+    end component;
+    
+begin
+
+    rx0 : entity work.uart_rx(rtl)
+        generic map (CLKFREQ=>CLKFREQ, BAUDRATE=>BAUDRATE,
+                     DATA_WIDTH=>DATA_WIDTH, PARITY=>PARITY, STOP_WIDTH=>STOP_WIDTH)
+        port map (clk=>clk, i_rxData=>i_rxData, i_data_ready=> s_uartData_ready,
+                  o_rxData => s_paralel_data, o_rxData_valid => s_uartData_valid, o_rxLed => o_rxLed);
+
+    tx0 : entity work.uart_tx(rtl)
+        generic map (CLKFREQ=>CLKFREQ, BAUDRATE=>BAUDRATE,
+                     DATA_WIDTH=>DATA_WIDTH, PARITY=>PARITY, STOP_WIDTH=>STOP_WIDTH)
+        port map (clk=>clk, o_txData=>o_txData, i_txData_valid => s_uartData_valid,
+                  i_txData => s_paralel_data, o_txData_ready => s_uartData_ready, o_txLed => o_txLed);
+                  
+   -- Combined Reading and Transmitting Data process with state machine
+    combined_proc: process(clk, rst)
+    begin
+        if rising_edge(clk) then
+            if rst = '0' then
+                -- Reset logic
+                state <= Idle;               
+                led1 <= '0';
+                s_byte_count <= 0;
+                s_data_received <= '0';
+                shift_reg <= (others => '0');
+            else
+                case state is
+                    when Idle =>
+                        s_data_received <= '0';
+                        s_byte_count <= 0;
+                        count_shifting_s <= 0;                   
+                        state <= Receiving;
+
+                    when Receiving =>   
+                        if s_uartData_valid = '1' then
+                            shift_reg(s_byte_count*DATA_WIDTH + DATA_WIDTH-1 downto s_byte_count*DATA_WIDTH) <= s_paralel_data;
+                            s_byte_count <= s_byte_count + 1;
+                            if s_byte_count = N-1 then -- Read all expected bytes and proceeds to shifting them
+                                s_data_received <= '1';                            
+                                state <= Transmitting;
+                            else
+                                state <= Waiting;
+                            end if;                        
+                        end if;
+                    
+                    when Waiting =>
+                        state <= Receiving;
+
+                    when Transmitting =>
+                        if shift_reg = "01010101010101010101010101010101" then
+                            led1 <= '1'; -- Turn on LED                        
+                        end if;          
+                        if i_trigger_s = '1' then
+                            o_trigger <= shift_reg(TOTAL_BITS-1); -- This is left shift
+                            shift_reg(TOTAL_BITS-1 downto 1) <= shift_reg(TOTAL_BITS-2 downto 0);
+                            shift_reg(0) <= '0';                               
+                            count_shifting_s <= count_shifting_s + 1; 
+                            state <= Transmitting;  
+                            if count_shifting_s = TOTAL_BITS-1 then
+                                state <= Idle;
+                            end if;                           
+                        end if;
+                end case;
+            end if;
+        end if;
+    end process combined_proc;    
+  
+    -- Process to control i_trigger_s with btn0
+    btn_trigger_proc: process(clk)
+    begin
+        if rising_edge(clk) then
+            if btn0 = '1' then
+                i_trigger_s <= '1'; -- Set i_trigger_s high when btn0 is pressed
+                
+            elsif btn0 = '0' then
+                i_trigger_s <= '0'; -- Set i_trigger_s low when btn1 is pressed
+                
+            end if;
+        end if;
+    end process btn_trigger_proc;
+ 
+end rtl;
